@@ -1,33 +1,31 @@
 ﻿using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Text;
 
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace TypedRegex.Generator
 {
 
     class RecordReceiver : ISyntaxReceiver
     {
-        public IEnumerable<RecordDeclarationSyntax> CandidateRecords => Records.Where(r => TypesUsedForTypedRegex.Contains(r.Identifier.Text));
+        public IEnumerable<RecordDeclarationSyntax> CandidateRecords => Records;
         List<RecordDeclarationSyntax> Records { get; } = new();
         HashSet<string> TypesUsedForTypedRegex { get; } = new();
         public void OnVisitSyntaxNode(SyntaxNode syntaxNode) 
         {
             if (syntaxNode is RecordDeclarationSyntax record)
             {
+                if (!record.AttributeLists.SelectMany(a => a.Attributes).Any())
+                    return;
+                if (record.ParameterList is null) // only allow records with primary constructor
+                    return;
                 Records.Add(record);
-            }
-
-            if (syntaxNode is InvocationExpressionSyntax invocation 
-                && invocation.Expression is MemberAccessExpressionSyntax memberAccess
-                && memberAccess.Expression is IdentifierNameSyntax g
-                && g.Identifier.Text is "TypedRegex" 
-                )
-            {
-                TypesUsedForTypedRegex.Add(memberAccess.ChildNodes().OfType<IdentifierNameSyntax>().Last().Identifier.Text);
             }
         }
     }
@@ -40,94 +38,111 @@ namespace TypedRegex.Generator
             context.RegisterForSyntaxNotifications(() => new RecordReceiver());
         }
 
+        readonly static string attributeText = @"using System;
+using System.Text.RegularExpressions;
+
+namespace System.Text.RegularExpressions.Typed
+{
+    internal class TypedRegexAttribute : Attribute
+    {
+        public Regex Regex { get; }
+        public TypedRegexAttribute(string pattern) => Regex = new Regex(pattern);
+    }
+}";
         public void Execute(GeneratorExecutionContext context)
         {
-            Compilation compilation = context.Compilation;
+            context.AddSource("TypedRegexAttribute.generated.cs", attributeText);
+
+            // we're going to create a new compilation that contains the attribute.
+            // TODO: we should allow source generators to provide source during initialize, so that this step isn't required.
+            CSharpParseOptions options = (context.Compilation as CSharpCompilation).SyntaxTrees[0].Options as CSharpParseOptions;
+            Compilation compilation = context.Compilation.AddSyntaxTrees(CSharpSyntaxTree.ParseText(SourceText.From(attributeText, Encoding.UTF8), options));
 
             if (context.SyntaxReceiver is not RecordReceiver receiver) return;
 
             var stringSymbol = compilation.GetTypeByMetadataName("System.String");
             var formatProviderSymbol = compilation.GetTypeByMetadataName("System.IFormatProvider");
+            var attributeSymbol = compilation.GetTypeByMetadataName("System.Text.RegularExpressions.Typed.TypedRegexAttribute");
+
+
+            var inconsistentRegex
+            = from record in receiver.CandidateRecords
+              let model = compilation.GetSemanticModel(record.SyntaxTree)
+              let symbol = model.GetDeclaredSymbol(record)
+              let constructor = symbol.Constructors.First()
+              let attribute = symbol.GetAttributes().FirstOrDefault(a => a.AttributeClass.Equals(attributeSymbol, SymbolEqualityComparer.Default))
+              where attribute is not null
+              let pattern = (string)attribute.ConstructorArguments.First().Value
+              let regex = new Regex(pattern)
+              let groupNames = regex.GetGroupNames().Skip(1)
+              let propertyNames = constructor.Parameters.Select(p => p.Name)
+              let missing = propertyNames.Except(groupNames)
+              where missing.Any()
+              select (model, regex, missing, record, symbol);
+
+            foreach (var item in inconsistentRegex)
+            {
+                var descriptor = new DiagnosticDescriptor(
+                    "TRX001", 
+                    "Incomplete Regex",
+                    "RegEx for parsing type {0} is missing named capture groups for properties {1}", 
+                    "TypedRegex", DiagnosticSeverity.Error, true);
+                context.ReportDiagnostic(Diagnostic.Create(descriptor, item.record.GetLocation(), item.symbol.Name, string.Join(",", item.missing)));
+            }
 
             var q = (
                 from record in receiver.CandidateRecords
-                    let model = compilation.GetSemanticModel(record.SyntaxTree)
-                    let symbol = model.GetDeclaredSymbol(record)
-                    let @namespace = symbol.ContainingNamespace.Name
-                    let typedName = $"{symbol.Name}TypedRegex"
-                    let parameters = (
-                        from parameter in record.ParameterList.Parameters
-                        let parameterSymbol = model.GetDeclaredSymbol(parameter)
-                        let parameterType = parameterSymbol.Type
-                        let parseMethod = (
-                            from method in parameterType.GetMembers("Parse").OfType<IMethodSymbol>()
-                            where (method.Parameters.Length == 2
-                            && method.Parameters[0].Type.Equals(stringSymbol, SymbolEqualityComparer.Default)
-                            && method.Parameters[1].Type.Equals(formatProviderSymbol, SymbolEqualityComparer.Default)
-                            ) || (method.Parameters.Length == 1
-                            && method.Parameters[0].Type.Equals(stringSymbol, SymbolEqualityComparer.Default)
-                            )
-                            select method
-                        ).FirstOrDefault()
-                        let parameterName = parameterSymbol.Name
-                        let variableName = parameterName.ToLowerInvariant()
-                        select (parameterName, parameterType, parseMethod, variableName)
-                    ).ToArray()
-                    select (record, symbol.Name, @namespace, typedName, parameters)
+                let model = compilation.GetSemanticModel(record.SyntaxTree)
+                let symbol = model.GetDeclaredSymbol(record)
+                let constructor = symbol.Constructors.First()
+                let attribute = symbol.GetAttributes().FirstOrDefault(a => a.AttributeClass.Equals(attributeSymbol, SymbolEqualityComparer.Default))
+                where attribute is not null
+                let pattern = (string)attribute.ConstructorArguments.First().Value // this gets the regex pattern at compile time, so we can check it and emit compiler errors!
+                let regex = new Regex(pattern)
+                let @namespace = symbol.ContainingNamespace.Name
+                let typedName = $"{symbol.Name}TypedRegex"
+                let parameters = (
+                    from parameter in record.ParameterList.Parameters
+                    let parameterSymbol = model.GetDeclaredSymbol(parameter)
+                    let parameterType = parameterSymbol.Type
+                    let parseMethod = (
+                        from method in parameterType.GetMembers("Parse").OfType<IMethodSymbol>()
+                        where (method.Parameters.Length == 2
+                        && method.Parameters[0].Type.Equals(stringSymbol, SymbolEqualityComparer.Default)
+                        && method.Parameters[1].Type.Equals(formatProviderSymbol, SymbolEqualityComparer.Default)
+                        ) || (method.Parameters.Length == 1
+                        && method.Parameters[0].Type.Equals(stringSymbol, SymbolEqualityComparer.Default)
+                        )
+                        select method
+                    ).FirstOrDefault()
+                    let parameterName = parameterSymbol.Name
+                    let variableName = parameterName.ToLowerInvariant()
+                    select (parameterName, parameterType, parseMethod, variableName)
+                ).ToArray()
+                select (record, regex, symbol.Name, @namespace, typedName, parameters)
             ).ToArray();
 
-            var usings = new[]{
-                "System",
-                "System.Linq",
-                "System.Globalization",
-                "System.Text.RegularExpressions"
-            }.Concat(q.Select(s => s.@namespace).Distinct());
+            //var diagnostics = from item in q
+            //                  let 
 
-            var sb = new StringBuilder();
-            foreach (var u in usings) sb.Append("using ").Append(u).Append(";").AppendLine();
+            //context.ReportDiagnostic(Diagnostic.Create(context))
 
-            sb.AppendLine(@"
-namespace System.Text.RegularExpressions.Typed
-{
-    internal abstract class TypedRegex<T>
-    {
-        protected Regex _regex;
-        internal abstract T Match(string input);
-        protected abstract string[] PropertyNames { get; }
-        protected TypedRegex(string pattern)
-        {
-            var regex = new Regex(pattern);
-            var groupNames = regex.GetGroupNames().Skip(1);
-            var missingCaptureGroups = PropertyNames.Except(groupNames);
-            if (missingCaptureGroups.Any())
+
+
+            foreach (var (record, regex, recordName, @namespace, typedName, parameters) in q)
             {
-                throw new FormatException($""The regex does not contain capture groups for properties {string.Join("","", missingCaptureGroups)}. The regular expression contained the following groups: '{string.Join("","", groupNames)}'"");
-            }
-            _regex = regex;
-        }
-    }
-
-    internal class TypedRegex
-    {");
-
-            foreach (var (record, recordName, _, typedName, parameters) in q)
-            {
-                var parameterNames = string.Join(", ", parameters.Select(p => $"\"{p.parameterName}\"").OrderBy(n => n));
-
+                var sb = new StringBuilder();
                 sb
-                    .AppendLine($@"
-        internal static TypedRegex<{recordName}> {recordName}(string pattern) => new {typedName}(pattern);
-        
-        class {typedName} : TypedRegex<{recordName}>
+                    .AppendLine($@"using System.Text.RegularExpressions;
+
+namespace {@namespace}
+{{
+    public partial record {recordName}
+    {{
+        static readonly Regex _regex = new Regex(@""{regex}"");
+        public static {recordName} Parse(string s)
         {{
-            public {typedName}(string pattern) : base(pattern) {{ }}
-            
-            protected override string[] PropertyNames => new[] {{ {parameterNames} }};
-
-            internal override {recordName} Match(string input)
-            {{
-                var match = _regex.Match(input);");
-
+                var match = _regex.Match(s);");
                 foreach (var (parameterName, parameterType, parseMethod, variableName) in parameters)
                 {
                     var fullyQualifiedName = parseMethod switch
@@ -150,16 +165,14 @@ namespace System.Text.RegularExpressions.Typed
                 sb
                     .Append($"                return new {recordName}(")
                     .Append(string.Join(", ", parameters.Select(p => p.variableName)))
-                    .AppendLine(");")
-                    .AppendLine(@"
-            }
-        }");
+                    .AppendLine(");");
+                sb.AppendLine(@$"
+        }}
+    }}
+}}");
+                context.AddSource($"{recordName}.generated.cs", sb.ToString());
             }
 
-            sb.AppendLine(@"    }
-}");
-
-            context.AddSource("TypedRegex.generated.cs", sb.ToString());
         }
     }
 }
