@@ -5,7 +5,7 @@ namespace TestLib
 {
     [TypedRegex(@"(?<Value>\d+) (?<Unit>[a-z]+)")]
     public partial record Amount(int Value, string Unit);
-    [TypedRegex(@"(?<X>\d+) (?<Y>\d+) (?<Z>\d+\.\d{2}) (?<G>[\da-zA-Z-]+)", "", "")]
+    [TypedRegex(@"(?<X>\d+) (?<Y>\d+) (?<Z>\d+\.\d{2}) (?<G>[\da-zA-Z-]+)")]
     public partial record MyRecord(int X, int Y, decimal Z, Guid G);
 
     [TypedRegex(@"")]

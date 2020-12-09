@@ -142,7 +142,7 @@ namespace {@namespace}
         static readonly Regex _regex = new Regex(@""{regex}"");
         public static {recordName} Parse(string s)
         {{
-                var match = _regex.Match(s);");
+            var match = _regex.Match(s);");
                 foreach (var (parameterName, parameterType, parseMethod, variableName) in parameters)
                 {
                     var fullyQualifiedName = parseMethod switch
@@ -154,20 +154,19 @@ namespace {@namespace}
                     var assignment = parseMethod switch
                     {
                         { Parameters: { Length: 2 } } 
-                            => $@"                var {variableName} = {fullyQualifiedName}(match.Groups[""{parameterName}""].Value, CultureInfo.InvariantCulture);",
+                            => $@"            var {variableName} = {fullyQualifiedName}(match.Groups[""{parameterName}""].Value, CultureInfo.InvariantCulture);",
                         { Parameters: { Length: 1 } } 
-                            => $@"                var {variableName} = {fullyQualifiedName}(match.Groups[""{parameterName}""].Value);",
+                            => $@"            var {variableName} = {fullyQualifiedName}(match.Groups[""{parameterName}""].Value);",
                         _ 
-                            => $@"                var {variableName} = match.Groups[""{parameterName}""].Value;"
+                            => $@"            var {variableName} = match.Groups[""{parameterName}""].Value;"
                     };
                     sb.AppendLine(assignment);
                 }
                 sb
-                    .Append($"                return new {recordName}(")
+                    .Append($"            return new {recordName}(")
                     .Append(string.Join(", ", parameters.Select(p => p.variableName)))
                     .AppendLine(");");
-                sb.AppendLine(@$"
-        }}
+                sb.AppendLine(@$"        }}
     }}
 }}");
                 context.AddSource($"{recordName}.generated.cs", sb.ToString());

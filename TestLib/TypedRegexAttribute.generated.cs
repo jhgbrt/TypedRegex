@@ -6,11 +6,6 @@ namespace System.Text.RegularExpressions.Typed
     internal class TypedRegexAttribute : Attribute
     {
         public Regex Regex { get; }
-        public string[] Formats { get; }
-        public TypedRegexAttribute(string pattern, params string[] formats)
-        {
-            Regex = new Regex(pattern);
-            Formats = formats;
-        }
+        public TypedRegexAttribute(string pattern) => Regex = new Regex(pattern);
     }
 }
